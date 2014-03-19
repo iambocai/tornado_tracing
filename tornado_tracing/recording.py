@@ -12,29 +12,28 @@ import tornado.httpclient
 import tornado.web
 import tornado.wsgi
 import warnings
+import sys
+
 
 with warnings.catch_warnings():
     warnings.simplefilter('ignore', DeprecationWarning)
-    from google.appengine.ext.appstats import recording
-from tornado.httpclient import AsyncHTTPClient
+    from tryfer.tracers import ZipkinTracer
 from tornado.options import define, options
 from tornado.stack_context import StackContext
-from tornado.web import RequestHandler
 
-define('enable_appstats', type=bool, default=False)
-
-# These methods from the appengine recording module are a part of our
-# public API.
-
-# start_recording(wsgi_environ) creates a recording context
-start_recording = recording.start_recording
-# end_recording(http_status) terminates a recording context
-end_recording = recording.end_recording
-
-# pre/post_call_hook(service, method, request, response) mark the
-# beginning/end of a time span to record in the trace.
-pre_call_hook = recording.pre_call_hook
-post_call_hook = recording.post_call_hook
+# import libraries if trace enabled
+# define("zipkin_trace", type=bool, default=True, help="Enable zipkin trace.(default: True)")
+if options.zipkin_trace:
+    import tornado.platform.twisted
+    tornado.platform.twisted.install()
+    from twisted.internet import reactor
+    from tryfer.tracers import push_tracer, DebugTracer, EndAnnotationTracer, ZipkinTracer, RESTkinHTTPTracer
+    from tryfer.trace import Trace, Annotation, Endpoint
+    from tryfer.formatters import hex_str
+    from twisted.web.client import Agent
+    from scrivener import ScribeClient
+    from twisted.internet.endpoints import clientFromString
+    from twisted.internet.endpoints import TCP4ClientEndpoint
 
 def save():
     '''Returns an object that can be passed to restore() to resume
@@ -47,12 +46,12 @@ def restore(recorder):
     recording.recorder = recorder
 
 
-class RecordingRequestHandler(RequestHandler):
+class RequestHandler(tornado.web.RequestHandler):
     '''RequestHandler subclass that establishes a recording context for each
     request.
     '''
     def __init__(self, *args, **kwargs):
-        super(RecordingRequestHandler, self).__init__(*args, **kwargs)
+        super(RequestHandler, self).__init__(*args, **kwargs)
         self.__recorder = None
 
     def _execute(self, transforms, *args, **kwargs):
@@ -60,39 +59,26 @@ class RecordingRequestHandler(RequestHandler):
             start_recording(tornado.wsgi.WSGIContainer.environ(self.request))
             recorder = save()
             @contextlib.contextmanager
-            def transfer_recorder():
-                restore(recorder)
-                yield
-            with StackContext(transfer_recorder):
-                super(RecordingRequestHandler, self)._execute(transforms,
-                                                              *args, **kwargs)
-        else:
-            super(RecordingRequestHandler, self)._execute(transforms,
-                                                          *args, **kwargs)
+        super(RequestHandler, self)._execute(transforms, *args, **kwargs)
 
     def finish(self, chunk=None):
         super(RecordingRequestHandler, self).finish(chunk)
         if options.enable_appstats:
             end_recording(self._status_code)
 
-class RecordingFallbackHandler(tornado.web.FallbackHandler):
+class FallbackHandler(tornado.web.FallbackHandler):
     '''FallbackHandler subclass that establishes a recording context for
     each request.
     '''
     def prepare(self):
-        if options.enable_appstats:
-            recording.start_recording(
-              tornado.wsgi.WSGIContainer.environ(self.request))
-            recorder = save()
-            @contextlib.contextmanager
-            def transfer_recorder():
-                restore(recorder)
-                yield
-            with StackContext(transfer_recorder):
-                super(RecordingFallbackHandler, self).prepare()
-            recording.end_recording(self._status_code)
-        else:
-            super(RecordingFallbackHandler, self).prepare()
+        if options.enable_trace:
+            push_tracer(EndAnnotationTracer(
+                    RESTkinHTTPTracer(Agent(reactor),
+                            trace_url='http://localhost:6956/v1.0/22/trace', 
+                            max_traces=1,
+                            max_idle_time=0)))
+        
+        super(FallbackHandler, self).prepare()
 
 def _request_info(request):
     '''Returns a tuple (method, url) for use in recording traces.
@@ -107,17 +93,19 @@ def _request_info(request):
 class HTTPClient(tornado.httpclient.HTTPClient):
     def fetch(self, request, *args, **kwargs):
         method, url = _request_info(request)
-        recording.pre_call_hook('HTTP', method, url, None)
+        ZipkinTracer.record(Annotation.string('Url', url))
+        ZipkinTracer.record(Annotation.client_send())
         response = super(HTTPClient, self).fetch(request, *args, **kwargs)
-        recording.post_call_hook('HTTP', method, url, None)
+        ZipkinTracer.record(Annotation.client_recv())
         return response
 
-class AsyncHTTPClient(AsyncHTTPClient):
+class AsyncHTTPClient(tornado.httpclient.AsyncHTTPClient):
     def fetch(self, request, callback, *args, **kwargs):
         method, url = _request_info(request)
-        recording.pre_call_hook('HTTP', method, url, None)
+        ZipkinTracer.record(Annotation.string('Url', url))
+        ZipkinTracer.record(Annotation.client_send())
         def wrapper(request, callback, response, *args):
-            recording.post_call_hook('HTTP', method, url, None)
+            ZipkinTracer.record(Annotation.client_recv())
             callback(response)
         super(AsyncHTTPClient, self).fetch(
           request,
